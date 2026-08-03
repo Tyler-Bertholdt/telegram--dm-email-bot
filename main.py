@@ -4,7 +4,6 @@ import json
 import httpx
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import RedirectResponse, HTMLResponse
-from google_auth_oauthlib.flow import Flow
 from config import config
 from filter_engine import EmailFilterEngine
 from gemini_engine import gemini_engine
@@ -50,7 +49,7 @@ def health_check():
     return {"status": "ok", "bot": "Gemini Mail Bot is running!"}
 
 # -------------------------------------------------------------------
-# MOBILE GOOGLE OAUTH AUTHENTICATION ROUTES
+# MOBILE GOOGLE OAUTH AUTHENTICATION ROUTES (DIRECT HTTP)
 # -------------------------------------------------------------------
 @app.get("/auth/login")
 def auth_login():
@@ -58,25 +57,22 @@ def auth_login():
     if not config.GMAIL_CLIENT_ID or not config.GMAIL_CLIENT_SECRET:
         return HTMLResponse("❌ Please set GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET in Render Environment Variables first.")
 
-    client_config = {
-        "web": {
-            "client_id": config.GMAIL_CLIENT_ID,
-            "client_secret": config.GMAIL_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token"
-        }
-    }
     redirect_uri = f"{config.RENDER_EXTERNAL_URL}/auth/callback"
-    flow = Flow.from_client_config(
-        client_config,
-        scopes=['https://www.googleapis.com/auth/gmail.modify'],
-        redirect_uri=redirect_uri
+    scope = "https://www.googleapis.com/auth/gmail.modify"
+    
+    auth_url = (
+        f"https://accounts.google.com/o/oauth2/v2/auth?"
+        f"client_id={config.GMAIL_CLIENT_ID}&"
+        f"redirect_uri={redirect_uri}&"
+        f"response_type=code&"
+        f"scope={scope}&"
+        f"access_type=offline&"
+        f"prompt=consent"
     )
-    authorization_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
-    return RedirectResponse(authorization_url)
+    return RedirectResponse(auth_url)
 
 @app.get("/auth/callback")
-def auth_callback(code: str = None, error: str = None):
+async def auth_callback(code: str = None, error: str = None):
     """Receives OAuth code from Google and outputs the token JSON on screen."""
     if error:
         return HTMLResponse(f"❌ Google OAuth Error: {error}")
@@ -86,25 +82,40 @@ def auth_callback(code: str = None, error: str = None):
             "❌ Missing authorization code. Please start from <a href='/auth/login'>/auth/login</a>."
         )
 
-    client_config = {
-        "web": {
+    redirect_uri = f"{config.RENDER_EXTERNAL_URL}/auth/callback"
+    token_url = "https://oauth2.googleapis.com/token"
+
+    payload = {
+        "code": code,
+        "client_id": config.GMAIL_CLIENT_ID,
+        "client_secret": config.GMAIL_CLIENT_SECRET,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code"
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            res = await client.post(token_url, data=payload, timeout=20.0)
+            token_data = res.json()
+
+        if "error" in token_data:
+            err_desc = token_data.get("error_description", token_data.get("error"))
+            return HTMLResponse(
+                f"❌ **OAuth Error:** {err_desc}<br><br><a href='/auth/login'>Click here to try again</a>"
+            )
+
+        # Build clean token.json payload required by google-auth
+        token_json = {
+            "token": token_data.get("access_token"),
+            "refresh_token": token_data.get("refresh_token"),
+            "token_uri": "https://oauth2.googleapis.com/token",
             "client_id": config.GMAIL_CLIENT_ID,
             "client_secret": config.GMAIL_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token"
+            "scopes": ["https://www.googleapis.com/auth/gmail.modify"]
         }
-    }
-    redirect_uri = f"{config.RENDER_EXTERNAL_URL}/auth/callback"
-    flow = Flow.from_client_config(
-        client_config,
-        scopes=['https://www.googleapis.com/auth/gmail.modify'],
-        redirect_uri=redirect_uri
-    )
-    
-    try:
-        flow.fetch_token(code=code)
-        creds = flow.credentials
-        token_json_str = creds.to_json()
+
+        token_json_str = json.dumps(token_json, indent=2)
+
         return HTMLResponse(content=f"""
         <html>
           <body style="font-family:sans-serif; padding:20px;">
@@ -115,9 +126,7 @@ def auth_callback(code: str = None, error: str = None):
         </html>
         """)
     except Exception as e:
-        return HTMLResponse(
-            f"❌ **Code Expired or Already Used:** {str(e)}<br><br>Please visit <a href='/auth/login'>/auth/login</a> again."
-        )
+        return HTMLResponse(f"❌ Error exchanging token: {str(e)}")
 
 # -------------------------------------------------------------------
 # TELEGRAM WEBHOOK HANDLER
