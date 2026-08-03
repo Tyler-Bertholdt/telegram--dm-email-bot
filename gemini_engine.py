@@ -1,29 +1,21 @@
 import json
-from google import genai
-from google.genai import types
+import httpx
 from config import config
 
 class GeminiEngine:
     def __init__(self):
-        self._init_client()
-
-    def _init_client(self):
-        """Initializes the GenAI Client with the API Key."""
-        if config.GEMINI_API_KEY:
-            self.client = genai.Client(api_key=config.GEMINI_API_KEY)
-        else:
-            self.client = None
+        self.api_key = config.GEMINI_API_KEY
+        # You can use gemini-2.5-flash, gemini-1.5-flash, or gemini-2.0-flash
+        self.model_name = config.GEMINI_MODEL_NAME or "gemini-2.5-flash"
 
     @property
-    def model_name(self) -> str:
-        return config.GEMINI_MODEL_NAME or "gemini-2.5-flash"
+    def endpoint_url(self) -> str:
+        return f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
 
-    def summarize_email(self, sender: str, recipient: str, subject: str, date_str: str, body: str) -> str:
-        """Generates a structured email summary for Telegram."""
-        if not self.client:
-            self._init_client()
-            if not self.client:
-                return "❌ **Gemini API Key missing.** Please set GEMINI_API_KEY in environment variables."
+    async def summarize_email(self, sender: str, recipient: str, subject: str, date_str: str, body: str) -> str:
+        """Summarizes an email using a direct REST POST request."""
+        if not self.api_key:
+            return "❌ **Gemini API Key missing.** Set `GEMINI_API_KEY` in environment variables."
 
         prompt = f"""
 Summarize the following email clearly for a Telegram message:
@@ -43,24 +35,41 @@ Please format the response strictly as:
 📝 **Summary:** [2-3 concise sentence summary]
 🎯 **Action Items:** [None or specific action required]
 """
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [{"text": prompt}]
+                }
+            ]
+        }
+
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt
-            )
-            return response.text
+            async with httpx.AsyncClient() as client:
+                res = await client.post(self.endpoint_url, json=payload, timeout=30.0)
+                if res.status_code != 200:
+                    return f"❌ Gemini API Error ({res.status_code}): {res.text}"
+
+                data = res.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return parts[0].get("text", "")
+
+                return "❌ No text returned from Gemini."
         except Exception as e:
-            return f"❌ Error generating summary ({self.model_name}): {str(e)}"
+            return f"❌ HTTP Error calling Gemini API: {str(e)}"
 
-    def parse_nlp_command(self, user_command: str) -> dict:
-        """Parses user natural language into structured JSON for Gmail actions."""
-        if not self.client:
-            self._init_client()
-            if not self.client:
-                return {"action": "error", "message": "GEMINI_API_KEY is missing in environment variables."}
+    async def parse_nlp_command(self, user_command: str) -> dict:
+        """Parses natural language commands using JSON mode via REST API."""
+        if not self.api_key:
+            return {"action": "error", "message": "GEMINI_API_KEY is missing."}
 
-        system_instruction = """
-You are a Gmail Intent Parser. Convert the user's natural language command into a structured JSON payload for Gmail API actions.
+        prompt = f"""
+You are a Gmail Intent Parser. Convert the user's natural language command into a JSON response.
+
+User Command: {user_command}
 
 Supported actions:
 - "summarize": user wants to read or summarize emails.
@@ -70,38 +79,65 @@ Supported actions:
 - "unknown": command is unclear or unsupported.
 
 Return ONLY a valid JSON object matching this schema:
-{
+{{
   "action": "summarize" | "search" | "trash" | "archive" | "unknown",
   "query": "<valid gmail search query string e.g. is:unread, label:newsletter, newer_than:2d>",
   "explanation": "<short natural language summary of what will happen>"
-}
+}}
 """
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [{"text": prompt}]
+                }
+            ],
+            "generationConfig": {
+                "responseMimeType": "application/json"
+            }
+        }
+
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=f"User Command: {user_command}",
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json"
-                )
-            )
-            return json.loads(response.text)
+            async with httpx.AsyncClient() as client:
+                res = await client.post(self.endpoint_url, json=payload, timeout=30.0)
+                if res.status_code != 200:
+                    return {"action": "error", "message": f"API Error ({res.status_code}): {res.text}"}
+
+                data = res.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        json_text = parts[0].get("text", "")
+                        return json.loads(json_text)
+
+                return {"action": "error", "message": "No JSON returned from Gemini."}
         except Exception as e:
             return {"action": "error", "message": str(e)}
 
-    def chat_response(self, user_text: str) -> str:
-        """Handles standard chatbot conversations."""
-        if not self.client:
-            self._init_client()
-            if not self.client:
-                return "❌ Gemini API Key is missing."
+    async def chat_response(self, user_text: str) -> str:
+        """Handles basic conversational queries."""
+        if not self.api_key:
+            return "❌ Gemini API Key is missing."
+
+        payload = {
+            "contents": [{"parts": [{"text": user_text}]}]
+        }
+
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=user_text
-            )
-            return response.text
+            async with httpx.AsyncClient() as client:
+                res = await client.post(self.endpoint_url, json=payload, timeout=30.0)
+                if res.status_code != 200:
+                    return f"❌ Error ({res.status_code}): {res.text}"
+
+                data = res.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return parts[0].get("text", "")
+                return "No response generated."
         except Exception as e:
-            return f"Error processing message ({self.model_name}): {str(e)}"
+            return f"Error: {str(e)}"
 
 gemini_engine = GeminiEngine()
