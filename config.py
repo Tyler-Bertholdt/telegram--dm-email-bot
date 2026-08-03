@@ -21,6 +21,9 @@ class Config:
     GMAIL_CLIENT_ID = os.getenv("GMAIL_CLIENT_ID", "")
     GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET", "")
 
+    # Filter Toggle (Default OFF so no emails are skipped)
+    ENABLE_FILTERING = os.getenv("ENABLE_FILTERING", "false").lower() == "true"
+
     # Server Configuration
     WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super-secret-webhook-key")
     RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")

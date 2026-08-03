@@ -28,7 +28,7 @@ class GmailManager:
             try:
                 creds = Credentials.from_authorized_user_file(token_path, SCOPES)
             except Exception as e:
-                print(f"Error reading local token file: {e}")
+                print(f"Error reading token file: {e}")
 
         if creds and creds.expired and creds.refresh_token:
             try:
@@ -107,7 +107,6 @@ class GmailManager:
             return {}
 
     def batch_trash_emails(self, msg_ids: list) -> bool:
-        """Trashes emails safely by adding TRASH label (compatible with gmail.modify scope)."""
         if not self.service or not msg_ids:
             return False
         try:
@@ -121,7 +120,6 @@ class GmailManager:
             return False
 
     def batch_untrash_emails(self, msg_ids: list) -> bool:
-        """Restores trashed or archived emails back to Inbox."""
         if not self.service or not msg_ids:
             return False
         try:
@@ -145,6 +143,19 @@ class GmailManager:
             return True
         except Exception as e:
             print(f"Error archiving emails: {e}")
+            return False
+
+    def batch_mark_spam(self, msg_ids: list) -> bool:
+        if not self.service or not msg_ids:
+            return False
+        try:
+            self.service.users().messages().batchModify(
+                userId='me',
+                body={'ids': msg_ids, 'addLabelIds': ['SPAM'], 'removeLabelIds': ['INBOX']}
+            ).execute()
+            return True
+        except Exception as e:
+            print(f"Error marking spam: {e}")
             return False
 
     def batch_mark_read(self, msg_ids: list) -> bool:
@@ -186,7 +197,7 @@ class GmailManager:
             print(f"Error starring emails: {e}")
             return False
 
-    def get_inbox_stats() -> dict:
+    def get_inbox_stats(self) -> dict:
         if not self.service:
             return {}
         try:
