@@ -1,43 +1,37 @@
 import uuid
-import base64
 import json
 import asyncio
 import httpx
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import RedirectResponse, HTMLResponse
 from config import config
-from filter_engine import EmailFilterEngine
 from gemini_engine import gemini_engine
 from gmail_manager import gmail_manager
+from gmail_notifier import (
+    start_notifier_polling_loop,
+    handle_gmail_pubsub_push,
+    send_email_summary_card,
+    send_telegram_msg,
+    MESSAGE_TO_EMAIL_MAP,
+    LAST_VIEWED_EMAILS
+)
 
 app = FastAPI(title="Gemini Mail Bot")
 
-# Application State Stores
+# Human-in-the-Loop pending action storage
 PENDING_ACTIONS = {}
 LAST_ACTION_STATE = {}
-MESSAGE_TO_EMAIL_MAP = {}
-LAST_VIEWED_EMAILS = {} # Tracks recent emails per chat_id
-PROCESSED_NOTIFICATIONS = set()
 
-async def send_telegram_message(chat_id: int, text: str, reply_markup: dict = None) -> int:
-    """Sends async HTTP message to Telegram and returns sentence message_id."""
+async def answer_telegram_callback(callback_query_id: str, text: str = "Action processed"):
+    """Acknowledges Telegram inline button clicks to stop button spinner."""
     if not config.TELEGRAM_BOT_TOKEN:
-        return None
-
-    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": False}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
+        return
+    url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
     async with httpx.AsyncClient() as client:
         try:
-            res = await client.post(url, json=payload)
-            data = res.json()
-            if data.get("ok"):
-                return data["result"]["message_id"]
+            await client.post(url, json={"callback_query_id": callback_query_id, "text": text})
         except Exception as e:
-            print(f"Failed to send Telegram message: {e}")
-    return None
+            print(f"Error answering callback query: {e}")
 
 async def delete_telegram_message(chat_id: int, message_id: int):
     """Deletes temporary indicator messages."""
@@ -47,64 +41,11 @@ async def delete_telegram_message(chat_id: int, message_id: int):
     async with httpx.AsyncClient() as client:
         try:
             await client.post(url, json={"chat_id": chat_id, "message_id": message_id})
-        except Exception as e:
+        except Exception:
             pass
 
 def get_universal_email_link(msg_id: str) -> str:
-    """Returns universal link to open email in default mail app or webmail."""
     return f"https://mail.google.com/mail/u/0/#all/{msg_id}"
-
-async def send_email_summary_card(chat_id: int, e: dict):
-    summary_text = await gemini_engine.summarize_email(
-        sender=e["sender"],
-        recipient=e["recipient"],
-        subject=e["subject"],
-        date_str=e["date"],
-        body=e["body"],
-        msg_id=e["id"]
-    )
-
-    action_id = str(uuid.uuid4())[:8]
-    PENDING_ACTIONS[action_id] = {
-        "action": "trash",
-        "ids": [e["id"]],
-        "query": f"subject:{e['subject']}"
-    }
-
-    mail_link = get_universal_email_link(e["id"])
-
-    buttons = {
-        "inline_keyboard": [[
-            {"text": "📬 Open Email", "url": mail_link},
-            {"text": "🗑️ Delete Email", "callback_data": f"approve:{action_id}"}
-        ]]
-    }
-
-    sent_msg_id = await send_telegram_message(chat_id, summary_text, buttons)
-    if sent_msg_id:
-        MESSAGE_TO_EMAIL_MAP[sent_msg_id] = {
-            "gmail_id": e["id"],
-            "subject": e["subject"],
-            "sender": e["sender"]
-        }
-        LAST_VIEWED_EMAILS[chat_id] = [e]
-
-async def poll_gmail_for_new_emails():
-    """Background polling to ensure no incoming email is missed."""
-    while True:
-        try:
-            target_chat = config.DEFAULT_CHAT_ID or (config.ALLOWED_USER_IDS[0] if config.ALLOWED_USER_IDS else None)
-            if target_chat and gmail_manager.service:
-                unread_emails = gmail_manager.search_emails("is:unread", max_results=3)
-                if unread_emails:
-                    for email in unread_emails:
-                        if email["id"] not in PROCESSED_NOTIFICATIONS:
-                            PROCESSED_NOTIFICATIONS.add(email["id"])
-                            if EmailFilterEngine.should_process_email(email["sender"], email["subject"], email["snippet"]):
-                                await send_email_summary_card(target_chat, email)
-        except Exception as e:
-            print(f"Polling loop error: {e}")
-        await asyncio.sleep(45)
 
 @app.on_event("startup")
 async def startup_event():
@@ -115,7 +56,8 @@ async def startup_event():
             await client.post(url, json={"url": webhook_url})
     
     gmail_manager.setup_pubsub_watch()
-    asyncio.create_task(poll_gmail_for_new_emails())
+    # Start the notifier polling loop in background
+    asyncio.create_task(start_notifier_polling_loop(PENDING_ACTIONS))
 
 @app.get("/")
 def health_check():
@@ -199,13 +141,15 @@ async def auth_callback(code: str = None, error: str = None):
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
 
-    # 1. Inline Buttons (HITL Confirmation)
+    # 1. Inline Buttons Execution (HITL Confirmation + Button Answer)
     if "callback_query" in data:
         cb = data["callback_query"]
+        cb_id = cb["id"]
         from_id = cb["from"]["id"]
         cb_data = cb.get("data", "")
 
         if config.ALLOWED_USER_IDS and from_id not in config.ALLOWED_USER_IDS:
+            await answer_telegram_callback(cb_id, "Unauthorized user")
             return {"status": "ignored"}
 
         if ":" in cb_data:
@@ -213,7 +157,8 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
             pending_item = PENDING_ACTIONS.get(action_id)
 
             if not pending_item:
-                background_tasks.add_task(send_telegram_message, from_id, "❌ Action expired or not found.")
+                await answer_telegram_callback(cb_id, "Action expired")
+                background_tasks.add_task(send_telegram_msg, from_id, "❌ Action expired or not found.")
             elif action == "approve":
                 act_type = pending_item["action"]
                 ids = pending_item["ids"]
@@ -243,15 +188,17 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     msg = "✅ Action completed."
 
                 del PENDING_ACTIONS[action_id]
-                background_tasks.add_task(send_telegram_message, from_id, msg)
+                await answer_telegram_callback(cb_id, "Action completed!")
+                background_tasks.add_task(send_telegram_msg, from_id, msg)
 
             elif action == "cancel":
                 del PENDING_ACTIONS[action_id]
-                background_tasks.add_task(send_telegram_message, from_id, "🚫 Action canceled safely.")
+                await answer_telegram_callback(cb_id, "Action canceled")
+                background_tasks.add_task(send_telegram_msg, from_id, "🚫 Action canceled safely.")
 
         return {"status": "ok"}
 
-    # 2. Text Commands & Processing
+    # 2. Text Commands & User Interactions
     if "message" in data:
         message = data["message"]
         chat_id = message["chat"]["id"]
@@ -259,38 +206,34 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         text = message.get("text", "").strip()
 
         if config.ALLOWED_USER_IDS and user_id not in config.ALLOWED_USER_IDS:
-            background_tasks.add_task(send_telegram_message, chat_id, "⛔ Unauthorized user.")
+            background_tasks.add_task(send_telegram_msg, chat_id, "⛔ Unauthorized user.")
             return {"status": "unauthorized"}
 
-        # Show auto-deleting loading indicator
-        loading_id = await send_telegram_message(chat_id, "⏳ *Processing request...*")
+        loading_id = await send_telegram_msg(chat_id, "⏳ *Processing request...*")
 
         try:
-            # Filter Toggle Command
+            # Toggle Filter
             if text.startswith("/filter"):
                 arg = text.replace("/filter", "").strip().lower()
                 if arg == "on":
                     config.ENABLE_FILTERING = True
-                    background_tasks.add_task(send_telegram_message, chat_id, "⚙️ Email filtering turned **ON**.")
+                    background_tasks.add_task(send_telegram_msg, chat_id, "⚙️ Email filtering turned **ON**.")
                 elif arg == "off":
                     config.ENABLE_FILTERING = False
-                    background_tasks.add_task(send_telegram_message, chat_id, "⚙️ Email filtering turned **OFF** (All emails will trigger alerts).")
+                    background_tasks.add_task(send_telegram_msg, chat_id, "⚙️ Email filtering turned **OFF** (All incoming emails will notify you).")
                 else:
                     status_str = "ON" if config.ENABLE_FILTERING else "OFF"
-                    background_tasks.add_task(send_telegram_message, chat_id, f"Filtering is currently **{status_str}**. Use `/filter on` or `/filter off`.")
+                    background_tasks.add_task(send_telegram_msg, chat_id, f"Filtering is currently **{status_str}**. Use `/filter on` or `/filter off`.")
 
-            # SMART DELETE COMMAND (Handles swipe-reply, numerical index, or latest viewed email)
+            # SMART DELETE
             elif text.lower() in ["delete", "/delete", "trash", "/trash"] or text.startswith("/delete"):
                 arg = text.replace("/delete", "").replace("/trash", "").strip()
-
                 target_email = None
 
-                # 1. Swipe-to-reply check
                 if "reply_to_message" in message:
                     replied_msg_id = message["reply_to_message"]["message_id"]
                     target_email = MESSAGE_TO_EMAIL_MAP.get(replied_msg_id)
 
-                # 2. Number index check (e.g. /delete 1)
                 elif arg.isdigit() and chat_id in LAST_VIEWED_EMAILS:
                     idx = int(arg) - 1
                     viewed_list = LAST_VIEWED_EMAILS[chat_id]
@@ -298,12 +241,10 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                         e_item = viewed_list[idx]
                         target_email = {"gmail_id": e_item["id"], "subject": e_item["subject"], "sender": e_item["sender"]}
 
-                # 3. Fallback: Last viewed email
                 elif not arg and chat_id in LAST_VIEWED_EMAILS and LAST_VIEWED_EMAILS[chat_id]:
                     e_item = LAST_VIEWED_EMAILS[chat_id][0]
                     target_email = {"gmail_id": e_item["id"], "subject": e_item["subject"], "sender": e_item["sender"]}
 
-                # Execute target email trash preview
                 if target_email:
                     action_id = str(uuid.uuid4())[:8]
                     PENDING_ACTIONS[action_id] = {
@@ -323,9 +264,8 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                             {"text": "❌ Cancel", "callback_data": f"cancel:{action_id}"}
                         ]]
                     }
-                    background_tasks.add_task(send_telegram_message, chat_id, preview, buttons)
+                    background_tasks.add_task(send_telegram_msg, chat_id, preview, buttons)
 
-                # 4. Search query delete (e.g. /delete Orufy)
                 elif arg:
                     emails = gmail_manager.search_emails(arg, max_results=5)
                     if emails:
@@ -333,19 +273,19 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                         PENDING_ACTIONS[action_id] = {"action": "trash", "ids": [e["id"] for e in emails], "query": arg}
                         preview = f"⚠️ **CONFIRM DELETE**\nQuery: `{arg}`\n\nTarget Emails:\n" + "\n".join([f"• *{e['subject']}* ({e['sender']})" for e in emails])
                         buttons = {"inline_keyboard": [[{"text": "✅ Confirm Delete", "callback_data": f"approve:{action_id}"}, {"text": "❌ Cancel", "callback_data": f"cancel:{action_id}"}]]}
-                        background_tasks.add_task(send_telegram_message, chat_id, preview, buttons)
+                        background_tasks.add_task(send_telegram_msg, chat_id, preview, buttons)
                     else:
-                        background_tasks.add_task(send_telegram_message, chat_id, f"No matching emails found to delete for query: `{arg}`.")
+                        background_tasks.add_task(send_telegram_msg, chat_id, f"No matching emails found to delete for query: `{arg}`.")
                 else:
-                    background_tasks.add_task(send_telegram_message, chat_id, "❌ No recent email found to delete. Search for emails first or swipe-reply to an email card!")
+                    background_tasks.add_task(send_telegram_msg, chat_id, "❌ No recent email found to delete. Search for emails first or swipe-reply to an email card!")
 
             # Undo Last Action
             elif text.startswith("/undo"):
                 if not LAST_ACTION_STATE or "ids" not in LAST_ACTION_STATE:
-                    background_tasks.add_task(send_telegram_message, chat_id, "❌ No recent action to undo.")
+                    background_tasks.add_task(send_telegram_msg, chat_id, "❌ No recent action to undo.")
                 else:
                     gmail_manager.batch_untrash_emails(LAST_ACTION_STATE["ids"])
-                    background_tasks.add_task(send_telegram_message, chat_id, f"↺ Restored {len(LAST_ACTION_STATE['ids'])} email(s) back to Inbox!")
+                    background_tasks.add_task(send_telegram_msg, chat_id, f"↺ Restored {len(LAST_ACTION_STATE['ids'])} email(s) back to Inbox!")
                     LAST_ACTION_STATE.clear()
 
             # Search Handler
@@ -359,22 +299,22 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
                 emails = gmail_manager.search_emails(q, max_results=5)
                 if emails is None:
-                    background_tasks.add_task(send_telegram_message, chat_id, "❌ **Gmail API Error:** Unauthenticated. Visit `/auth/login`.")
+                    background_tasks.add_task(send_telegram_msg, chat_id, "❌ **Gmail API Error:** Unauthenticated. Visit `/auth/login`.")
                 elif len(emails) == 0:
-                    background_tasks.add_task(send_telegram_message, chat_id, f"No emails found for query: `{q}`")
+                    background_tasks.add_task(send_telegram_msg, chat_id, f"No emails found for query: `{q}`")
                 else:
                     LAST_VIEWED_EMAILS[chat_id] = emails
                     res_str = f"🔍 **Found {len(emails)} emails:**\n\n"
                     for idx, e in enumerate(emails, start=1):
                         mail_link = get_universal_email_link(e['id'])
                         res_str += f"{idx}. **[{e['subject']}]({mail_link})**\n   From: `{e['sender']}`\n\n"
-                    res_str += "💡 *Tip: Type `/delete 1` or swipe-reply to delete any email above!*"
-                    sent_id = await send_telegram_message(chat_id, res_str)
+                    res_str += "💡 *Tip: Type `/delete 1` or swipe-reply `delete` to trash any email above!*"
+                    sent_id = await send_telegram_msg(chat_id, res_str)
                     if sent_id:
                         for e in emails:
                             MESSAGE_TO_EMAIL_MAP[sent_id] = {"gmail_id": e["id"], "subject": e["subject"], "sender": e["sender"]}
 
-            # Quick Actions: Archive, Read, Unread, Star, Spam
+            # Quick Actions
             elif any(text.startswith(cmd) for cmd in ["/archive", "/read", "/unread", "/star", "/spam"]):
                 cmd = text.split()[0][1:]
                 q = text.replace(f"/{cmd}", "").strip() or "is:unread"
@@ -384,36 +324,36 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     PENDING_ACTIONS[action_id] = {"action": cmd, "ids": [e["id"] for e in emails], "query": q}
                     preview = f"⚠️ **Confirm {cmd.upper()}**\nQuery: `{q}`\n\nTarget Emails:\n" + "\n".join([f"• *{e['subject']}* ({e['sender']})" for e in emails])
                     buttons = {"inline_keyboard": [[{"text": f"✅ Approve {cmd.title()}", "callback_data": f"approve:{action_id}"}, {"text": "❌ Cancel", "callback_data": f"cancel:{action_id}"}]]}
-                    background_tasks.add_task(send_telegram_message, chat_id, preview, buttons)
+                    background_tasks.add_task(send_telegram_msg, chat_id, preview, buttons)
 
             # AI Features
             elif text.startswith("/brief"):
                 emails = gmail_manager.search_emails("newer_than:2d", max_results=5) or []
                 brief = await gemini_engine.generate_briefing(emails) if emails else "No recent emails to brief."
-                background_tasks.add_task(send_telegram_message, chat_id, f"⚡ **Inbox Digest:**\n\n{brief}")
+                background_tasks.add_task(send_telegram_msg, chat_id, f"⚡ **Inbox Digest:**\n\n{brief}")
 
             elif text.startswith("/whoami"):
                 sender = text.replace("/whoami", "").strip()
                 q = f"from:{sender}" if sender else "newer_than:7d"
                 emails = gmail_manager.search_emails(q, max_results=5) or []
                 res = await gemini_engine.chat_with_inbox(f"Who is {sender}? Summarize our past relationship and topics.", emails)
-                background_tasks.add_task(send_telegram_message, chat_id, res)
+                background_tasks.add_task(send_telegram_msg, chat_id, res)
 
             elif text.startswith("/newsletters"):
                 emails = gmail_manager.search_emails("label:newsletter OR category:promotions", max_results=5) or []
                 res = await gemini_engine.summarize_newsletter_group(emails) if emails else "No newsletter emails found."
-                background_tasks.add_task(send_telegram_message, chat_id, f"📰 **Newsletters Digest:**\n\n{res}")
+                background_tasks.add_task(send_telegram_msg, chat_id, f"📰 **Newsletters Digest:**\n\n{res}")
 
             elif text.startswith("/shopping") or text.startswith("/travel") or text.startswith("/finance"):
                 cat = text[1:]
                 emails = gmail_manager.search_emails(f"{cat} OR order OR flight OR bank", max_results=5) or []
                 res = await gemini_engine.chat_with_inbox(f"Summarize all my recent {cat} emails, bookings, and receipts.", emails)
-                background_tasks.add_task(send_telegram_message, chat_id, res)
+                background_tasks.add_task(send_telegram_msg, chat_id, res)
 
             elif text.startswith("/stats"):
                 stats = gmail_manager.get_inbox_stats()
                 res = f"📊 **Inbox Statistics:**\n\n• Email: `{stats.get('email')}`\n• Total Messages: `{stats.get('total_messages')}`\n• Unread Count: `{stats.get('unread_messages')}`\n• Threads: `{stats.get('threads_total')}`"
-                background_tasks.add_task(send_telegram_message, chat_id, res)
+                background_tasks.add_task(send_telegram_msg, chat_id, res)
 
             elif text.startswith("/nlp"):
                 prompt = text.replace("/nlp", "").strip()
@@ -424,7 +364,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 if act == "summarize":
                     emails = gmail_manager.search_emails(q, max_results=3) or []
                     for e in emails:
-                        background_tasks.add_task(send_email_summary_card, chat_id, e)
+                        background_tasks.add_task(send_email_summary_card, chat_id, e, PENDING_ACTIONS)
                 elif act in ["trash", "archive", "spam", "read", "unread", "star"]:
                     emails = gmail_manager.search_emails(q, max_results=5) or []
                     if emails:
@@ -432,7 +372,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                         PENDING_ACTIONS[action_id] = {"action": act, "ids": [e["id"] for e in emails], "query": q}
                         preview = f"⚠️ **Confirm {act.upper()}**\nQuery: `{q}`\n\nTarget Emails:\n" + "\n".join([f"• *{e['subject']}* ({e['sender']})" for e in emails])
                         buttons = {"inline_keyboard": [[{"text": f"✅ Approve {act.title()}", "callback_data": f"approve:{action_id}"}, {"text": "❌ Cancel", "callback_data": f"cancel:{action_id}"}]]}
-                        background_tasks.add_task(send_telegram_message, chat_id, preview, buttons)
+                        background_tasks.add_task(send_telegram_msg, chat_id, preview, buttons)
 
             elif text.startswith("/start") or text.startswith("/help"):
                 f_status = "ON" if config.ENABLE_FILTERING else "OFF"
@@ -450,13 +390,13 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     "• `/newsletters`, `/shopping`, `/travel`, `/finance` – Category digests\n"
                     "• `/stats` – View inbox statistics\n"
                     "• `/chat <question>` – Natural language inbox search\n\n"
-                    "💡 *Pro Tip: Type `/search Orufy` and then type `/delete 1` or swipe-reply `delete` to trash it instantly!*"
+                    "💡 *Pro Tip: Type `/search Orufy` and then type `/delete 1` or tap `🗑️ Delete Email` button on any summary card!*"
                 )
-                background_tasks.add_task(send_telegram_message, chat_id, help_menu)
+                background_tasks.add_task(send_telegram_msg, chat_id, help_menu)
 
             else:
                 res = await gemini_engine.chat_response(text)
-                background_tasks.add_task(send_telegram_message, chat_id, res)
+                background_tasks.add_task(send_telegram_msg, chat_id, res)
 
         finally:
             await delete_telegram_message(chat_id, loading_id)
@@ -469,21 +409,5 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 @app.post("/webhook/gmail")
 async def gmail_pubsub_webhook(request: Request, background_tasks: BackgroundTasks):
     body = await request.json()
-    message = body.get("message", {})
-    data_b64 = message.get("data")
-
-    if data_b64:
-        decoded_data = json.loads(base64.b64decode(data_b64).decode("utf-8"))
-        history_id = decoded_data.get("historyId")
-        if history_id:
-            unread_emails = gmail_manager.search_emails("is:unread", max_results=1) or []
-            if unread_emails:
-                email = unread_emails[0]
-                if email["id"] not in PROCESSED_NOTIFICATIONS:
-                    PROCESSED_NOTIFICATIONS.add(email["id"])
-                    if EmailFilterEngine.should_process_email(email["sender"], email["subject"], email["snippet"]):
-                        target_chat = config.DEFAULT_CHAT_ID or (config.ALLOWED_USER_IDS[0] if config.ALLOWED_USER_IDS else None)
-                        if target_chat:
-                            background_tasks.add_task(send_email_summary_card, target_chat, email)
-
+    background_tasks.add_task(handle_gmail_pubsub_push, body, PENDING_ACTIONS)
     return {"status": "ok"}
