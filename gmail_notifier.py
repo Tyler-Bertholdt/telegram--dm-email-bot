@@ -8,13 +8,11 @@ from filter_engine import EmailFilterEngine
 from gemini_engine import gemini_engine
 from gmail_manager import gmail_manager
 
-# Dedicated notification tracking store
 PROCESSED_EMAIL_IDS = set()
 MESSAGE_TO_EMAIL_MAP = {}
 LAST_VIEWED_EMAILS = {}
 
 async def send_telegram_msg(chat_id: int, text: str, reply_markup: dict = None) -> int:
-    """Async utility to send Telegram messages and return message_id."""
     if not config.TELEGRAM_BOT_TOKEN:
         return None
 
@@ -34,7 +32,6 @@ async def send_telegram_msg(chat_id: int, text: str, reply_markup: dict = None) 
     return None
 
 async def send_email_summary_card(chat_id: int, e: dict, pending_actions_dict: dict):
-    """Formats and sends an interactive summary card with buttons for a new email."""
     summary_text = await gemini_engine.summarize_email(
         sender=e["sender"],
         recipient=e["recipient"],
@@ -67,10 +64,13 @@ async def send_email_summary_card(chat_id: int, e: dict, pending_actions_dict: d
             "subject": e["subject"],
             "sender": e["sender"]
         }
-        LAST_VIEWED_EMAILS[chat_id] = [e]
+        
+        # Track email as viewed for chat_id
+        if chat_id not in LAST_VIEWED_EMAILS:
+            LAST_VIEWED_EMAILS[chat_id] = []
+        LAST_VIEWED_EMAILS[chat_id].insert(0, e)
 
 async def seed_initial_unread_emails():
-    """Seeds current unread emails on startup so old emails don't trigger alerts."""
     try:
         if gmail_manager.service:
             unread = gmail_manager.search_emails("is:unread", max_results=15) or []
@@ -81,14 +81,12 @@ async def seed_initial_unread_emails():
         print(f"Error seeding unread emails: {e}")
 
 async def start_notifier_polling_loop(pending_actions_dict: dict):
-    """Background polling loop that guarantees 100% notification delivery."""
     await seed_initial_unread_emails()
 
     while True:
         try:
             target_chat = config.DEFAULT_CHAT_ID or (config.ALLOWED_USER_IDS[0] if config.ALLOWED_USER_IDS else None)
             if target_chat and gmail_manager.service:
-                # Fetch recent unread emails
                 unread_emails = gmail_manager.search_emails("is:unread newer_than:2d", max_results=10) or []
                 for email in unread_emails:
                     msg_id = email["id"]
@@ -100,11 +98,9 @@ async def start_notifier_polling_loop(pending_actions_dict: dict):
         except Exception as e:
             print(f"Notifier polling error: {e}")
 
-        # Check every 30 seconds
         await asyncio.sleep(30)
 
 async def handle_gmail_pubsub_push(body: dict, pending_actions_dict: dict):
-    """Processes Pub/Sub push webhooks."""
     message = body.get("message", {})
     data_b64 = message.get("data")
 

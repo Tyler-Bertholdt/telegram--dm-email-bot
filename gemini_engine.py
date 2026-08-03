@@ -14,12 +14,16 @@ class GeminiEngine:
     def endpoint_url(self) -> str:
         return f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
 
-    async def _post(self, prompt: str, json_mode: bool = False) -> str:
-        """Helper to post prompts to Gemini REST API."""
+    async def _post(self, prompt: str, system_instruction: str = None, json_mode: bool = False) -> str:
         if not self.api_key:
             return "❌ **Gemini API Key missing.** Set `GEMINI_API_KEY` in environment variables."
 
         payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        
+        # Explicit system instruction so Gemini knows it is connected to Gmail
+        default_system = "You are an AI Email Assistant connected to the user's Gmail inbox via official Gmail APIs. You have full authorized access to summarize, search, and answer questions about their emails."
+        payload["systemInstruction"] = {"parts": [{"text": system_instruction or default_system}]}
+
         if json_mode:
             payload["generationConfig"] = {"responseMimeType": "application/json"}
 
@@ -51,7 +55,7 @@ Subject: {subject}
 Body:
 {body[:3000]}
 
-Format output strictly:
+Format output strictly as:
 👤 **From:** {sender}
 📌 **Subject:** {subject}
 📅 **Date:** {date_str}
@@ -60,7 +64,7 @@ Format output strictly:
 """
         res = await self._post(prompt)
         if msg_id and "❌ Error" not in res:
-            res += f"\n\n🔗 [Open Email in Gmail App](https://mail.google.com/mail/u/0/#all/{msg_id})"
+            res += f"\n\n📬 [Open Email](https://mail.google.com/mail/u/0/#all/{msg_id})"
         return res
 
     async def parse_nlp_command(self, user_command: str) -> dict:
@@ -69,12 +73,12 @@ You are a Gmail Intent Parser. Convert the user command into JSON.
 
 User Command: {user_command}
 
-Supported actions: "summarize", "search", "trash", "archive", "spam", "read", "unread", "star", "otp", "expenses", "tracking", "action", "brief", "phishing", "unknown".
+Supported actions: "summarize", "search", "trash", "archive", "spam", "read", "unread", "star", "chat", "unknown".
 
 Return ONLY a JSON object:
 {{
-  "action": "summarize" | "search" | "trash" | "archive" | "spam" | "read" | "unread" | "star" | "otp" | "expenses" | "tracking" | "action" | "brief" | "phishing" | "unknown",
-  "query": "<gmail search query e.g. is:unread, label:newsletter, category:updates>",
+  "action": "summarize" | "search" | "trash" | "archive" | "spam" | "read" | "unread" | "star" | "chat" | "unknown",
+  "query": "<valid gmail search query string e.g. is:unread, label:inbox, newer_than:7d>",
   "explanation": "<short explanation>"
 }}
 """
@@ -82,42 +86,16 @@ Return ONLY a JSON object:
         try:
             return json.loads(res_text)
         except Exception:
-            return {"action": "unknown", "query": user_command, "explanation": "Direct search"}
+            return {"action": "chat", "query": "newer_than:7d", "explanation": "General query"}
 
     async def generate_briefing(self, emails: list) -> str:
         email_text = "\n---\n".join([f"From: {e['sender']}\nSubject: {e['subject']}\nSnippet: {e['snippet']}" for e in emails])
         prompt = f"Provide a executive morning digest of these inbox emails in bullet points:\n{email_text[:4000]}"
         return await self._post(prompt)
 
-    async def extract_action_items(self, emails: list) -> str:
-        email_text = "\n---\n".join([f"From: {e['sender']}\nSubject: {e['subject']}\nBody: {e['body'][:500]}" for e in emails])
-        prompt = f"Extract all action items, tasks, and deadlines from these emails:\n{email_text[:4000]}"
-        return await self._post(prompt)
-
-    async def analyze_phishing(self, email_detail: dict) -> str:
-        prompt = f"""
-Analyze this email for security risk and phishing likelihood (Rate 0-10):
-
-From: {email_detail.get('sender')}
-Subject: {email_detail.get('subject')}
-Body:
-{email_detail.get('body')[:2000]}
-
-Provide:
-1. 🛡️ Risk Score (0-10)
-2. ⚠️ Suspicious Indicators
-3. 💡 Recommendation
-"""
-        return await self._post(prompt)
-
-    async def summarize_newsletter_group(self, emails: list) -> str:
-        email_text = "\n---\n".join([f"Subject: {e['subject']}\nSnippet: {e['snippet']}" for e in emails])
-        prompt = f"Group and summarize these newsletter emails into key topics:\n{email_text[:3000]}"
-        return await self._post(prompt)
-
     async def chat_with_inbox(self, query: str, context_emails: list) -> str:
         context = "\n---\n".join([f"From: {e['sender']}\nDate: {e['date']}\nSubject: {e['subject']}\nBody: {e['body'][:600]}" for e in context_emails])
-        prompt = f"Answer the user's question based strictly on their emails:\n\nUser Question: {query}\n\nEmail Context:\n{context[:4000]}"
+        prompt = f"Answer the user's question clearly based on their emails below:\n\nUser Question: {query}\n\nEmail Context:\n{context[:4000]}"
         return await self._post(prompt)
 
     async def chat_response(self, user_text: str) -> str:
