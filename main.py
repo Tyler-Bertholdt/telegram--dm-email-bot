@@ -76,8 +76,16 @@ def auth_login():
     return RedirectResponse(authorization_url)
 
 @app.get("/auth/callback")
-def auth_callback(code: str):
+def auth_callback(code: str = None, error: str = None):
     """Receives OAuth code from Google and outputs the token JSON on screen."""
+    if error:
+        return HTMLResponse(f"❌ Google OAuth Error: {error}")
+    
+    if not code:
+        return HTMLResponse(
+            "❌ Missing authorization code. Please start from <a href='/auth/login'>/auth/login</a>."
+        )
+
     client_config = {
         "web": {
             "client_id": config.GMAIL_CLIENT_ID,
@@ -92,19 +100,24 @@ def auth_callback(code: str):
         scopes=['https://www.googleapis.com/auth/gmail.modify'],
         redirect_uri=redirect_uri
     )
-    flow.fetch_token(code=code)
-    creds = flow.credentials
-
-    token_json_str = creds.to_json()
-    return HTMLResponse(content=f"""
-    <html>
-      <body style="font-family:sans-serif; padding:20px;">
-        <h2>✅ Authorization Successful!</h2>
-        <p>Copy the JSON text in the box below and paste it as <b>GMAIL_TOKEN_JSON</b> in Render Environment Variables:</p>
-        <textarea style="width:100%; height:250px; font-size:12px;">{token_json_str}</textarea>
-      </body>
-    </html>
-    """)
+    
+    try:
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        token_json_str = creds.to_json()
+        return HTMLResponse(content=f"""
+        <html>
+          <body style="font-family:sans-serif; padding:20px;">
+            <h2>✅ Authorization Successful!</h2>
+            <p>Copy the JSON text in the box below and paste it as <b>GMAIL_TOKEN_JSON</b> in Render Environment Variables:</p>
+            <textarea style="width:100%; height:250px; font-size:12px;">{token_json_str}</textarea>
+          </body>
+        </html>
+        """)
+    except Exception as e:
+        return HTMLResponse(
+            f"❌ **Code Expired or Already Used:** {str(e)}<br><br>Please visit <a href='/auth/login'>/auth/login</a> again."
+        )
 
 # -------------------------------------------------------------------
 # TELEGRAM WEBHOOK HANDLER
