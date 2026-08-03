@@ -5,18 +5,24 @@ from config import config
 
 class GeminiEngine:
     def __init__(self):
+        self._init_client()
+
+    def _init_client(self):
+        """Initializes or re-initializes the Google GenAI Client."""
         if config.GEMINI_API_KEY:
             self.client = genai.Client(api_key=config.GEMINI_API_KEY)
         else:
             self.client = None
 
     def summarize_email(self, sender: str, recipient: str, subject: str, date_str: str, body: str) -> str:
-        """Generates a structured summary for new incoming emails using Gemini 2.5 Flash."""
+        """Generates a clean Telegram summary of an email using Gemini 2.5 Flash."""
         if not self.client:
-            return "Gemini API Key is missing."
+            self._init_client()
+            if not self.client:
+                return "❌ **Gemini API Key missing.** Set `GEMINI_API_KEY` in Render environment variables."
 
         prompt = f"""
-You are an AI email assistant. Summarize the following email clearly and concisely.
+Summarize the following email clearly for a Telegram message:
 
 From: {sender}
 To: {recipient}
@@ -24,14 +30,14 @@ Date: {date_str}
 Subject: {subject}
 
 Body:
-{body[:3000]}  # Truncate very long bodies
+{body[:3000]}
 
-Format your response as a Telegram message with bold headers:
-👤 **From:** [Sender Name / Email]
-📌 **Subject:** [Subject]
-📅 **Date:** [Date/Time]
-📝 **Summary:** [2-3 sentence summary]
-🎯 **Action Needed:** [Yes/No - if Yes, what action]
+Please format the response strictly as:
+👤 **From:** {sender}
+📌 **Subject:** {subject}
+📅 **Date:** {date_str}
+📝 **Summary:** [2-3 concise sentence summary]
+🎯 **Action Items:** [None or specific action required]
 """
         try:
             response = self.client.models.generate_content(
@@ -40,22 +46,32 @@ Format your response as a Telegram message with bold headers:
             )
             return response.text
         except Exception as e:
-            return f"Error generating summary: {str(e)}"
+            return f"❌ Error generating summary: {str(e)}"
 
     def parse_nlp_command(self, user_command: str) -> dict:
-        """Uses Gemini Function Calling / Structured Output to convert user commands into structured actions."""
+        """Parses natural language commands into Gmail parameters via Gemini JSON Output."""
         if not self.client:
-            return {"action": "error", "message": "Gemini API Key missing"}
+            self._init_client()
+            if not self.client:
+                return {"action": "error", "message": "GEMINI_API_KEY is missing in Render variables."}
 
         system_instruction = """
-You are a Gmail Intent Parser. Convert the user's natural language command into structured JSON parameters for Gmail API.
+You are a Gmail Intent Parser. Convert the user's natural language command into a structured JSON payload for Gmail API actions.
+
+Supported actions:
+- "summarize": user wants to read or summarize emails.
+- "search": user wants to find or list emails.
+- "trash": user wants to delete emails.
+- "archive": user wants to archive emails.
+- "unknown": command is unclear or unsupported.
+
 Return ONLY a valid JSON object matching this schema:
 {
-  "action": "search" | "archive" | "trash" | "mark_spam" | "mark_read" | "unknown",
-  "query": "<gmail search query e.g. is:unread label:newsletter from:substack>",
+  "action": "summarize" | "search" | "trash" | "archive" | "unknown",
+  "query": "<valid gmail search query string e.g. is:unread, label:newsletter, newer_than:2d>",
   "explanation": "<short natural language summary of what will happen>"
 }
-Do not include code markdown ticks (```json).
+Do not wrap response in markdown code ticks.
 """
         try:
             response = self.client.models.generate_content(
@@ -71,9 +87,11 @@ Do not include code markdown ticks (```json).
             return {"action": "error", "message": str(e)}
 
     def chat_response(self, user_text: str) -> str:
-        """Generates conversational responses for non-command chat messages."""
+        """Handles regular conversational messages."""
         if not self.client:
-            return "Gemini API Key is missing."
+            self._init_client()
+            if not self.client:
+                return "❌ Gemini API Key is missing."
         try:
             response = self.client.models.generate_content(
                 model='gemini-2.5-flash',
