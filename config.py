@@ -14,7 +14,7 @@ class Config:
     # Gemini Configuration
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
     # Defaulting to latest stable Flash model
-    GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+    GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-flash-latest")
 
     # Google Cloud & Gmail Configuration
     GCP_PUBSUB_TOPIC = os.getenv("GCP_PUBSUB_TOPIC", "")
