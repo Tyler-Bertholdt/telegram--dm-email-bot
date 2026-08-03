@@ -3,6 +3,8 @@ import base64
 import json
 import httpx
 from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi.responses import RedirectResponse, HTMLResponse
+from google_auth_oauthlib.flow import Flow
 from config import config
 from filter_engine import EmailFilterEngine
 from gemini_engine import gemini_engine
@@ -11,6 +13,7 @@ from gmail_manager import gmail_manager
 app = FastAPI(title="Gemini Mail Bot")
 
 # In-memory storage for Human-in-the-Loop pending actions
+# Format: { action_id: {"action": "trash", "ids": [...], "query": "..."} }
 PENDING_ACTIONS = {}
 
 async def send_telegram_message(chat_id: int, text: str, reply_markup: dict = None):
@@ -45,6 +48,63 @@ async def startup_event():
 @app.get("/")
 def health_check():
     return {"status": "ok", "bot": "Gemini Mail Bot is running!"}
+
+# -------------------------------------------------------------------
+# MOBILE GOOGLE OAUTH AUTHENTICATION ROUTES
+# -------------------------------------------------------------------
+@app.get("/auth/login")
+def auth_login():
+    """Starts Google OAuth login flow directly from phone browser."""
+    if not config.GMAIL_CLIENT_ID or not config.GMAIL_CLIENT_SECRET:
+        return HTMLResponse("❌ Please set GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET in Render Environment Variables first.")
+
+    client_config = {
+        "web": {
+            "client_id": config.GMAIL_CLIENT_ID,
+            "client_secret": config.GMAIL_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token"
+        }
+    }
+    redirect_uri = f"{config.RENDER_EXTERNAL_URL}/auth/callback"
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=['https://www.googleapis.com/auth/gmail.modify'],
+        redirect_uri=redirect_uri
+    )
+    authorization_url, _ = flow.authorization_url(prompt='consent', access_type='offline')
+    return RedirectResponse(authorization_url)
+
+@app.get("/auth/callback")
+def auth_callback(code: str):
+    """Receives OAuth code from Google and outputs the token JSON on screen."""
+    client_config = {
+        "web": {
+            "client_id": config.GMAIL_CLIENT_ID,
+            "client_secret": config.GMAIL_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token"
+        }
+    }
+    redirect_uri = f"{config.RENDER_EXTERNAL_URL}/auth/callback"
+    flow = Flow.from_client_config(
+        client_config,
+        scopes=['https://www.googleapis.com/auth/gmail.modify'],
+        redirect_uri=redirect_uri
+    )
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+
+    token_json_str = creds.to_json()
+    return HTMLResponse(content=f"""
+    <html>
+      <body style="font-family:sans-serif; padding:20px;">
+        <h2>✅ Authorization Successful!</h2>
+        <p>Copy the JSON text in the box below and paste it as <b>GMAIL_TOKEN_JSON</b> in Render Environment Variables:</p>
+        <textarea style="width:100%; height:250px; font-size:12px;">{token_json_str}</textarea>
+      </body>
+    </html>
+    """)
 
 # -------------------------------------------------------------------
 # TELEGRAM WEBHOOK HANDLER
@@ -123,7 +183,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 background_tasks.add_task(send_telegram_message, chat_id, "Usage: `/search is:unread`")
             else:
                 emails = gmail_manager.search_emails(query, max_results=5)
-                if not emails:
+                if emails is None:
+                    background_tasks.add_task(
+                        send_telegram_message, chat_id, "❌ **Gmail API Error:** Bot is unauthenticated. Visit `/auth/login` on your phone to authenticate."
+                    )
+                elif len(emails) == 0:
                     background_tasks.add_task(send_telegram_message, chat_id, f"No emails found for: `{query}`")
                 else:
                     res_str = f"🔍 **Found {len(emails)} emails:**\n\n"
@@ -138,7 +202,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 background_tasks.add_task(send_telegram_message, chat_id, "Usage: `/delete newsletters from last week`")
             else:
                 emails = gmail_manager.search_emails(query, max_results=5)
-                if not emails:
+                if emails is None:
+                    background_tasks.add_task(
+                        send_telegram_message, chat_id, "❌ **Gmail API Error:** Bot is unauthenticated. Visit `/auth/login` on your phone to authenticate."
+                    )
+                elif len(emails) == 0:
                     background_tasks.add_task(send_telegram_message, chat_id, "No matching emails found to delete.")
                 else:
                     action_id = str(uuid.uuid4())[:8]
@@ -163,7 +231,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         # Command: /nlp <natural language command>
         elif text.startswith("/nlp"):
             prompt = text.replace("/nlp", "").strip()
-            # Added `await` here:
             parsed = await gemini_engine.parse_nlp_command(prompt)
             act = parsed.get("action")
             q = parsed.get("query", "is:unread")
@@ -176,11 +243,14 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
             elif act == "summarize":
                 emails = gmail_manager.search_emails(q, max_results=3)
-                if not emails:
+                if emails is None:
+                    background_tasks.add_task(
+                        send_telegram_message, chat_id, "❌ **Gmail API Error:** Bot is unauthenticated. Visit `/auth/login` on your phone to authenticate."
+                    )
+                elif len(emails) == 0:
                     background_tasks.add_task(send_telegram_message, chat_id, f"No emails found for query: `{q}`")
                 else:
                     for e in emails:
-                        # Added `await` here:
                         summary = await gemini_engine.summarize_email(
                             sender=e["sender"],
                             recipient=e["recipient"],
@@ -192,7 +262,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
             elif act in ["archive", "trash"]:
                 emails = gmail_manager.search_emails(q, max_results=5)
-                if not emails:
+                if emails is None:
+                    background_tasks.add_task(
+                        send_telegram_message, chat_id, "❌ **Gmail API Error:** Bot is unauthenticated. Visit `/auth/login` on your phone to authenticate."
+                    )
+                elif len(emails) == 0:
                     background_tasks.add_task(send_telegram_message, chat_id, f"No emails found for query: `{q}`")
                 else:
                     action_id = str(uuid.uuid4())[:8]
@@ -220,7 +294,6 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
         # General Conversation / Q&A
         else:
-            # Added `await` here:
             response_text = await gemini_engine.chat_response(text)
             background_tasks.add_task(send_telegram_message, chat_id, response_text)
 
@@ -245,7 +318,7 @@ async def process_incoming_email_notification(history_id: str):
         print(f"Skipping filtered email: {subject}")
         return
 
-    # Generate Gemini Summary with `await`
+    # Generate Gemini Summary
     summary = await gemini_engine.summarize_email(
         sender=sender,
         recipient=email.get("recipient", ""),
