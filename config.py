@@ -13,13 +13,15 @@ class Config:
 
     # Gemini Configuration
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+    # Defaulting to latest stable Flash model
+    GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
 
     # Google Cloud & Gmail Configuration
-    GCP_PUBSUB_TOPIC = os.getenv("GCP_PUBSUB_TOPIC", "") # e.g. "projects/YOUR_PROJECT/topics/gmail-notifications"
-    GMAIL_CREDENTIALS_JSON = os.getenv("GMAIL_CREDENTIALS_JSON", "") # Service Account / OAuth JSON content
+    GCP_PUBSUB_TOPIC = os.getenv("GCP_PUBSUB_TOPIC", "")
+    GMAIL_TOKEN_JSON = os.getenv("GMAIL_TOKEN_JSON", "")
 
     # Server Configuration
     WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super-secret-webhook-key")
-    RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "") # e.g. "https://your-app.onrender.com"
+    RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
 config = Config()

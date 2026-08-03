@@ -10,12 +10,11 @@ from gmail_manager import gmail_manager
 
 app = FastAPI(title="Gemini Mail Bot")
 
-# In-memory storage for Human-in-the-Loop pending actions
-# Format: { action_id: {"action": "trash", "ids": [...], "query": "..."} }
+# In-memory storage for pending Human-in-the-Loop confirmations
 PENDING_ACTIONS = {}
 
 async def send_telegram_message(chat_id: int, text: str, reply_markup: dict = None):
-    """Utility to send async messages to Telegram."""
+    """Sends asynchronous HTTP messages to Telegram."""
     if not config.TELEGRAM_BOT_TOKEN:
         print("TELEGRAM_BOT_TOKEN is not configured.")
         return
@@ -33,14 +32,14 @@ async def send_telegram_message(chat_id: int, text: str, reply_markup: dict = No
 
 @app.on_event("startup")
 async def startup_event():
-    """Startup routine: Register Telegram Webhook and renew Gmail watch."""
+    """Startup routine: Registers Telegram Webhook & Gmail Watch."""
     if config.RENDER_EXTERNAL_URL and config.TELEGRAM_BOT_TOKEN:
         webhook_url = f"{config.RENDER_EXTERNAL_URL}/webhook/telegram"
         url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/setWebhook"
         async with httpx.AsyncClient() as client:
             await client.post(url, json={"url": webhook_url})
     
-    # Refresh Gmail Watch Notification
+    # Establish Gmail Push Watch Notification
     gmail_manager.setup_pubsub_watch()
 
 @app.get("/")
@@ -54,7 +53,7 @@ def health_check():
 async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
 
-    # 1. Handle Inline Button Clicks (Approve / Cancel)
+    # 1. Handle Inline Button Clicks (Approvals / Cancellations)
     if "callback_query" in data:
         cb = data["callback_query"]
         from_id = cb["from"]["id"]
@@ -100,7 +99,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         user_id = message["from"]["id"]
         text = message.get("text", "").strip()
 
-        # Security User Check
+        # Authorization check
         if config.ALLOWED_USER_IDS and user_id not in config.ALLOWED_USER_IDS:
             background_tasks.add_task(send_telegram_message, chat_id, "⛔ Unauthorized user.")
             return {"status": "unauthorized"}
