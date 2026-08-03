@@ -10,7 +10,7 @@ from gmail_manager import gmail_manager
 
 app = FastAPI(title="Gemini Mail Bot")
 
-# In-memory storage for pending Human-in-the-Loop confirmations
+# In-memory storage for Human-in-the-Loop pending actions
 PENDING_ACTIONS = {}
 
 async def send_telegram_message(chat_id: int, text: str, reply_markup: dict = None):
@@ -163,7 +163,8 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         # Command: /nlp <natural language command>
         elif text.startswith("/nlp"):
             prompt = text.replace("/nlp", "").strip()
-            parsed = gemini_engine.parse_nlp_command(prompt)
+            # Added `await` here:
+            parsed = await gemini_engine.parse_nlp_command(prompt)
             act = parsed.get("action")
             q = parsed.get("query", "is:unread")
             err_msg = parsed.get("message", "Unknown error")
@@ -179,7 +180,8 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     background_tasks.add_task(send_telegram_message, chat_id, f"No emails found for query: `{q}`")
                 else:
                     for e in emails:
-                        summary = gemini_engine.summarize_email(
+                        # Added `await` here:
+                        summary = await gemini_engine.summarize_email(
                             sender=e["sender"],
                             recipient=e["recipient"],
                             subject=e["subject"],
@@ -218,7 +220,8 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
 
         # General Conversation / Q&A
         else:
-            response_text = gemini_engine.chat_response(text)
+            # Added `await` here:
+            response_text = await gemini_engine.chat_response(text)
             background_tasks.add_task(send_telegram_message, chat_id, response_text)
 
     return {"status": "ok"}
@@ -242,8 +245,8 @@ async def process_incoming_email_notification(history_id: str):
         print(f"Skipping filtered email: {subject}")
         return
 
-    # Generate Gemini Summary
-    summary = gemini_engine.summarize_email(
+    # Generate Gemini Summary with `await`
+    summary = await gemini_engine.summarize_email(
         sender=sender,
         recipient=email.get("recipient", ""),
         subject=subject,
