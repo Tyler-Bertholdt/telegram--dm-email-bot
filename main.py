@@ -159,11 +159,11 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                 LAST_ACTION_STATE["ids"] = ids
 
                 if act_type == "trash":
-                    gmail_manager.batch_trash_emails(ids)
-                    msg = f"✅ Moved {len(ids)} email(s) to Trash. Type `/undo` to restore."
+                    success = gmail_manager.batch_trash_emails(ids)
+                    msg = f"✅ Moved {len(ids)} email(s) to Trash. Type `/undo` to restore." if success else "❌ Failed to trash email."
                 elif act_type == "archive":
-                    gmail_manager.batch_archive_emails(ids)
-                    msg = f"✅ Archived {len(ids)} email(s). Type `/undo` to restore."
+                    success = gmail_manager.batch_archive_emails(ids)
+                    msg = f"✅ Archived {len(ids)} email(s). Type `/undo` to restore." if success else "❌ Failed to archive email."
                 elif act_type == "spam":
                     gmail_manager.batch_mark_spam(ids)
                     msg = f"✅ Marked {len(ids)} email(s) as Spam."
@@ -214,7 +214,7 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
                     replied_msg_id = message["reply_to_message"]["message_id"]
                     target_email = MESSAGE_TO_EMAIL_MAP.get(replied_msg_id)
 
-                # 2. Numerical index (e.g., delete 1, /delete 2)
+                # 2. Numerical index (e.g., delete 1)
                 elif raw_arg.isdigit() and chat_id in LAST_VIEWED_EMAILS:
                     idx = int(raw_arg) - 1
                     viewed_list = LAST_VIEWED_EMAILS[chat_id]

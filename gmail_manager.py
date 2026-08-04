@@ -82,6 +82,7 @@ class GmailManager:
             recipient = next((h['value'] for h in headers if h['name'].lower() == 'to'), 'Unknown Recipient')
             date_str = next((h['value'] for h in headers if h['name'].lower() == 'date'), '')
             snippet = msg.get('snippet', '')
+            internal_date = int(msg.get('internalDate', 0))
 
             body = snippet
             payload = msg.get('payload', {})
@@ -100,37 +101,38 @@ class GmailManager:
                 "subject": subject,
                 "date": date_str,
                 "snippet": snippet,
-                "body": body
+                "body": body,
+                "internal_date": internal_date
             }
         except Exception as e:
             print(f"Error getting message {msg_id}: {e}")
             return {}
 
     def batch_trash_emails(self, msg_ids: list) -> bool:
+        """Native Gmail API trash endpoint for each message ID."""
         if not self.service or not msg_ids:
             return False
-        try:
-            self.service.users().messages().batchModify(
-                userId='me',
-                body={'ids': msg_ids, 'addLabelIds': ['TRASH'], 'removeLabelIds': ['INBOX']}
-            ).execute()
-            return True
-        except Exception as e:
-            print(f"Error trashing emails: {e}")
-            return False
+        success = True
+        for msg_id in msg_ids:
+            try:
+                self.service.users().messages().trash(userId='me', id=msg_id).execute()
+            except Exception as e:
+                print(f"Error trashing email {msg_id}: {e}")
+                success = False
+        return success
 
     def batch_untrash_emails(self, msg_ids: list) -> bool:
+        """Native Gmail API untrash endpoint for each message ID."""
         if not self.service or not msg_ids:
             return False
-        try:
-            self.service.users().messages().batchModify(
-                userId='me',
-                body={'ids': msg_ids, 'addLabelIds': ['INBOX'], 'removeLabelIds': ['TRASH']}
-            ).execute()
-            return True
-        except Exception as e:
-            print(f"Error restoring emails: {e}")
-            return False
+        success = True
+        for msg_id in msg_ids:
+            try:
+                self.service.users().messages().untrash(userId='me', id=msg_id).execute()
+            except Exception as e:
+                print(f"Error untrashing email {msg_id}: {e}")
+                success = False
+        return success
 
     def batch_archive_emails(self, msg_ids: list) -> bool:
         if not self.service or not msg_ids:

@@ -1,12 +1,16 @@
 import base64
 import json
 import uuid
+import time
 import asyncio
 import httpx
 from config import config
 from filter_engine import EmailFilterEngine
 from gemini_engine import gemini_engine
 from gmail_manager import gmail_manager
+
+# Record the exact timestamp when the bot starts up (in milliseconds)
+BOT_START_TIME_MS = int(time.time() * 1000)
 
 PROCESSED_EMAIL_IDS = set()
 MESSAGE_TO_EMAIL_MAP = {}
@@ -65,7 +69,6 @@ async def send_email_summary_card(chat_id: int, e: dict, pending_actions_dict: d
             "sender": e["sender"]
         }
         
-        # Track email as viewed for chat_id
         if chat_id not in LAST_VIEWED_EMAILS:
             LAST_VIEWED_EMAILS[chat_id] = []
         LAST_VIEWED_EMAILS[chat_id].insert(0, e)
@@ -73,7 +76,7 @@ async def send_email_summary_card(chat_id: int, e: dict, pending_actions_dict: d
 async def seed_initial_unread_emails():
     try:
         if gmail_manager.service:
-            unread = gmail_manager.search_emails("is:unread", max_results=15) or []
+            unread = gmail_manager.search_emails("is:unread", max_results=20) or []
             for e in unread:
                 PROCESSED_EMAIL_IDS.add(e["id"])
             print(f"✅ Notifier initialized: Seeded {len(PROCESSED_EMAIL_IDS)} existing unread emails.")
@@ -87,9 +90,16 @@ async def start_notifier_polling_loop(pending_actions_dict: dict):
         try:
             target_chat = config.DEFAULT_CHAT_ID or (config.ALLOWED_USER_IDS[0] if config.ALLOWED_USER_IDS else None)
             if target_chat and gmail_manager.service:
-                unread_emails = gmail_manager.search_emails("is:unread newer_than:2d", max_results=10) or []
+                unread_emails = gmail_manager.search_emails("is:unread newer_than:1d", max_results=10) or []
                 for email in unread_emails:
                     msg_id = email["id"]
+                    msg_date_ms = email.get("internal_date", 0)
+
+                    # IGNORE any email that arrived BEFORE the bot started
+                    if msg_date_ms > 0 and msg_date_ms < (BOT_START_TIME_MS - 30000):
+                        PROCESSED_EMAIL_IDS.add(msg_id)
+                        continue
+
                     if msg_id not in PROCESSED_EMAIL_IDS:
                         PROCESSED_EMAIL_IDS.add(msg_id)
                         if EmailFilterEngine.should_process_email(email["sender"], email["subject"], email["snippet"]):
@@ -112,8 +122,16 @@ async def handle_gmail_pubsub_push(body: dict, pending_actions_dict: dict):
             target_chat = config.DEFAULT_CHAT_ID or (config.ALLOWED_USER_IDS[0] if config.ALLOWED_USER_IDS else None)
             
             for email in unread_emails:
-                if email["id"] not in PROCESSED_EMAIL_IDS:
-                    PROCESSED_EMAIL_IDS.add(email["id"])
+                msg_id = email["id"]
+                msg_date_ms = email.get("internal_date", 0)
+
+                # IGNORE any email that arrived BEFORE the bot started
+                if msg_date_ms > 0 and msg_date_ms < (BOT_START_TIME_MS - 30000):
+                    PROCESSED_EMAIL_IDS.add(msg_id)
+                    continue
+
+                if msg_id not in PROCESSED_EMAIL_IDS:
+                    PROCESSED_EMAIL_IDS.add(msg_id)
                     if EmailFilterEngine.should_process_email(email["sender"], email["subject"], email["snippet"]):
                         if target_chat:
                             await send_email_summary_card(target_chat, email, pending_actions_dict)
